@@ -1,4 +1,4 @@
-﻿# simulate_scenarios.ps1
+# simulate_scenarios.ps1
 # Script de simulação End-to-End para o Distributed Workflow Orchestrator & Edge Rate Limiter
 
 $BaseUrl = "http://localhost:8080/api/v1/workflows/checkout"

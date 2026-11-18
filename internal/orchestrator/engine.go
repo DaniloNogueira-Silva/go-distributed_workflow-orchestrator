@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/eventsourcing"
+	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
 )
 
 // WorkerExecutor abstracts the communication with downstream workers (e.g., gRPC Workers).
@@ -36,15 +37,35 @@ func NewEngine(repo eventsourcing.Repository, blueprint *WorkflowBlueprint, work
 	}
 }
 
+func (e *Engine) appendEventWithMetrics(ctx context.Context, workflowID string, eventType eventsourcing.EventType, stepName string, payload interface{}) (*eventsourcing.WorkflowEvent, error) {
+	ev, err := e.repo.AppendEvent(ctx, workflowID, eventType, stepName, payload)
+	if err == nil {
+		metrics.EventsPersistedTotal.WithLabelValues(string(eventType)).Inc()
+	}
+	return ev, err
+}
+
 // StartWorkflow creates a new workflow event stream and evaluates the Saga state machine until completion or rollback.
 func (e *Engine) StartWorkflow(ctx context.Context, workflowID string, initialPayload interface{}) (*eventsourcing.WorkflowState, error) {
+	startTime := time.Now()
+	metrics.WorkflowsInFlight.Inc()
+	defer metrics.WorkflowsInFlight.Dec()
+
 	_, err := e.repo.CreateWorkflow(ctx, workflowID, e.blueprint.Name, initialPayload)
 	if err != nil {
 		return nil, fmt.Errorf("create workflow %s: %w", workflowID, err)
 	}
+	metrics.EventsPersistedTotal.WithLabelValues(string(eventsourcing.EventWorkflowStarted)).Inc()
 
 	log.Printf("[Orchestrator] Workflow %s started (%s)", workflowID, e.blueprint.Name)
-	return e.Evaluate(ctx, workflowID)
+	state, evalErr := e.Evaluate(ctx, workflowID)
+	if state != nil {
+		metrics.WorkflowsTotal.WithLabelValues(string(state.Status)).Inc()
+		metrics.WorkflowDuration.WithLabelValues(string(state.Status)).Observe(time.Since(startTime).Seconds())
+	} else if evalErr != nil {
+		metrics.WorkflowsTotal.WithLabelValues("ERROR").Inc()
+	}
+	return state, evalErr
 }
 
 // GetWorkflowState reconstructs and returns the current state of a workflow by replaying its events.
@@ -79,7 +100,7 @@ func (e *Engine) Evaluate(ctx context.Context, workflowID string) (*eventsourcin
 		nextStep, found := e.findNextStep(state)
 		if !found {
 			// All steps in the blueprint have completed (or non-critical step was dead-lettered)
-			_, err := e.repo.AppendEvent(ctx, workflowID, eventsourcing.EventWorkflowCompleted, "", map[string]string{
+			_, err := e.appendEventWithMetrics(ctx, workflowID, eventsourcing.EventWorkflowCompleted, "", map[string]string{
 				"status": "COMPLETED",
 			})
 			if err != nil {
@@ -118,7 +139,7 @@ func (e *Engine) executeStepWithPolicy(ctx context.Context, state *eventsourcing
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if _, err := e.repo.AppendEvent(ctx, workflowID, step.StartEvent, step.Name, eventsourcing.StepEventPayload{
+		if _, err := e.appendEventWithMetrics(ctx, workflowID, step.StartEvent, step.Name, eventsourcing.StepEventPayload{
 			StepName: step.Name,
 			Attempt:  attempt,
 		}); err != nil {
@@ -128,9 +149,13 @@ func (e *Engine) executeStepWithPolicy(ctx context.Context, state *eventsourcing
 		log.Printf("[Orchestrator] Workflow %s -> Executing step '%s' (Action: %s, Attempt: %d/%d)",
 			workflowID, step.Name, step.Action, attempt, maxAttempts)
 
+		stepStart := time.Now()
 		output, execErr := e.worker.ExecuteStep(ctx, workflowID, step.Name, step.Action, state.InitialPayload)
+		metrics.SagaStepDuration.WithLabelValues(step.Name, "execute").Observe(time.Since(stepStart).Seconds())
+
 		if execErr == nil {
-			_, err := e.repo.AppendEvent(ctx, workflowID, step.SuccessEvent, step.Name, eventsourcing.StepEventPayload{
+			metrics.SagaStepExecutionsTotal.WithLabelValues(step.Name, step.Action, "SUCCEEDED").Inc()
+			_, err := e.appendEventWithMetrics(ctx, workflowID, step.SuccessEvent, step.Name, eventsourcing.StepEventPayload{
 				StepName: step.Name,
 				Attempt:  attempt,
 				Output:   output,
@@ -143,13 +168,14 @@ func (e *Engine) executeStepWithPolicy(ctx context.Context, state *eventsourcing
 		}
 
 		lastErr = execErr
+		metrics.SagaStepExecutionsTotal.WithLabelValues(step.Name, step.Action, "FAILED").Inc()
 		log.Printf("[Orchestrator] Workflow %s -> Step '%s' FAILED on attempt %d/%d: %v",
 			workflowID, step.Name, attempt, maxAttempts, execErr)
 
 		// If RetryThenDLQ and more attempts remain, wait with exponential backoff
 		if step.FailurePolicy == PolicyRetryThenDLQ && attempt < maxAttempts {
 			backoff := time.Duration(float64(step.InitialBackoff) * math.Pow(2, float64(attempt-1)))
-			_, _ = e.repo.AppendEvent(ctx, workflowID, eventsourcing.EventStepRetryScheduled, step.Name, eventsourcing.StepEventPayload{
+			_, _ = e.appendEventWithMetrics(ctx, workflowID, eventsourcing.EventStepRetryScheduled, step.Name, eventsourcing.StepEventPayload{
 				StepName: step.Name,
 				Attempt:  attempt,
 				Error:    execErr.Error(),
@@ -163,7 +189,7 @@ func (e *Engine) executeStepWithPolicy(ctx context.Context, state *eventsourcing
 	}
 
 	// All attempts for this step failed
-	_, err := e.repo.AppendEvent(ctx, workflowID, step.FailEvent, step.Name, eventsourcing.StepEventPayload{
+	_, err := e.appendEventWithMetrics(ctx, workflowID, step.FailEvent, step.Name, eventsourcing.StepEventPayload{
 		StepName: step.Name,
 		Attempt:  maxAttempts,
 		Error:    lastErr.Error(),
@@ -179,7 +205,7 @@ func (e *Engine) executeStepWithPolicy(ctx context.Context, state *eventsourcing
 		if dlqEvent == "" {
 			dlqEvent = eventsourcing.EventStepDeadLettered
 		}
-		if _, err := e.repo.AppendEvent(ctx, workflowID, dlqEvent, step.Name, eventsourcing.StepEventPayload{
+		if _, err := e.appendEventWithMetrics(ctx, workflowID, dlqEvent, step.Name, eventsourcing.StepEventPayload{
 			StepName: step.Name,
 			Attempt:  maxAttempts,
 			Error:    fmt.Sprintf("max retries (%d) exceeded: %v", maxAttempts, lastErr),
@@ -191,6 +217,8 @@ func (e *Engine) executeStepWithPolicy(ctx context.Context, state *eventsourcing
 			return fmt.Errorf("save to DLQ: %w", err)
 		}
 
+		metrics.DLQMessagesTotal.WithLabelValues(step.Name).Inc()
+		metrics.SagaStepExecutionsTotal.WithLabelValues(step.Name, step.Action, "DEAD_LETTERED").Inc()
 		log.Printf("[Orchestrator] Workflow %s -> Step '%s' exhausted %d retries; sent to Dead Letter Queue (workflow continues)",
 			workflowID, step.Name, maxAttempts)
 		return nil
@@ -198,7 +226,7 @@ func (e *Engine) executeStepWithPolicy(ctx context.Context, state *eventsourcing
 	default: // PolicyFailAndCompensate
 		log.Printf("[Orchestrator] Workflow %s -> Step '%s' failed critically; initiating Saga rollback (compensations)",
 			workflowID, step.Name)
-		_, err := e.repo.AppendEvent(ctx, workflowID, eventsourcing.EventWorkflowCompensating, "", map[string]string{
+		_, err := e.appendEventWithMetrics(ctx, workflowID, eventsourcing.EventWorkflowCompensating, "", map[string]string{
 			"failed_step": step.Name,
 			"reason":      lastErr.Error(),
 		})
@@ -226,27 +254,32 @@ func (e *Engine) runCompensationsBackward(ctx context.Context, state *eventsourc
 		log.Printf("[Orchestrator] Workflow %s -> Compensating step '%s' (Action: %s)",
 			workflowID, stepDef.Name, stepDef.CompensationAction)
 
-		if _, err := e.repo.AppendEvent(ctx, workflowID, eventsourcing.EventStepCompensationStart, stepDef.Name, eventsourcing.StepEventPayload{
+		if _, err := e.appendEventWithMetrics(ctx, workflowID, eventsourcing.EventStepCompensationStart, stepDef.Name, eventsourcing.StepEventPayload{
 			StepName: stepDef.Name,
 		}); err != nil {
 			return fmt.Errorf("append compensation start for %s: %w", stepDef.Name, err)
 		}
 
+		compStart := time.Now()
 		compOutput, err := e.worker.CompensateStep(ctx, workflowID, stepDef.Name, stepDef.CompensationAction, state.InitialPayload)
+		metrics.SagaStepDuration.WithLabelValues(stepDef.Name, "compensate").Observe(time.Since(compStart).Seconds())
+
 		if err != nil {
 			// Record critical failure if compensation itself fails
-			_, _ = e.repo.AppendEvent(ctx, workflowID, eventsourcing.EventWorkflowFailed, stepDef.Name, map[string]string{
+			_, _ = e.appendEventWithMetrics(ctx, workflowID, eventsourcing.EventWorkflowFailed, stepDef.Name, map[string]string{
 				"error": fmt.Sprintf("compensation failed for %s: %v", stepDef.Name, err),
 			})
 			return fmt.Errorf("compensate step %s: %w", stepDef.Name, err)
 		}
+
+		metrics.SagaStepExecutionsTotal.WithLabelValues(stepDef.Name, stepDef.CompensationAction, "COMPENSATED").Inc()
 
 		compEvent := stepDef.CompensateEvent
 		if compEvent == "" {
 			compEvent = eventsourcing.EventStepCompensated
 		}
 
-		if _, err := e.repo.AppendEvent(ctx, workflowID, compEvent, stepDef.Name, eventsourcing.StepEventPayload{
+		if _, err := e.appendEventWithMetrics(ctx, workflowID, compEvent, stepDef.Name, eventsourcing.StepEventPayload{
 			StepName: stepDef.Name,
 			Output:   compOutput,
 		}); err != nil {
@@ -257,7 +290,7 @@ func (e *Engine) runCompensationsBackward(ctx context.Context, state *eventsourc
 			workflowID, stepDef.Name, stepDef.CompensationAction)
 	}
 
-	_, err := e.repo.AppendEvent(ctx, workflowID, eventsourcing.EventWorkflowRolledBack, "", map[string]string{
+	_, err := e.appendEventWithMetrics(ctx, workflowID, eventsourcing.EventWorkflowRolledBack, "", map[string]string{
 		"status": "ROLLED_BACK",
 	})
 	if err != nil {

@@ -83,7 +83,7 @@ func Run() {
 		RefillRatePerSec: cfg.OutboundRateLimitRefill,
 		TTLSeconds:       60,
 	})
-	outboundLimiter := limiter.NewOutboundLimiter(outboundBucket, 150*time.Millisecond, 50)
+	outboundLimiter := limiter.NewOutboundLimiter(outboundBucket, 50*time.Millisecond, 200)
 
 	// 4. Start gRPC Worker Server (Payment, Inventory, Fulfillment, Notification)
 	grpcListener, err := net.Listen("tcp", cfg.GRPCAddr)

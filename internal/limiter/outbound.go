@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
 )
 
 // OutboundLimiter wraps TokenBucketLimiter to throttle outbound calls to external third-party APIs
@@ -48,10 +50,16 @@ func (ol *OutboundLimiter) Acquire(ctx context.Context, externalService string) 
 		}
 
 		if res.Allowed {
+			if delayedRetries > 0 {
+				metrics.OutboundRateLimitRequestsTotal.WithLabelValues(externalService, "true").Inc()
+			} else {
+				metrics.OutboundRateLimitRequestsTotal.WithLabelValues(externalService, "false").Inc()
+			}
 			return delayedRetries, nil
 		}
 
 		delayedRetries++
+		metrics.OutboundRateLimitDelaysTotal.WithLabelValues(externalService).Inc()
 		log.Printf("[OutboundLimiter] Outbound rate limit reached for '%s'. Delaying %v and retrying (retry #%d)...",
 			externalService, ol.retryDelay, delayedRetries)
 
