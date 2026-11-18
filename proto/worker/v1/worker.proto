@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package worker.v1;
+
+option go_package = "github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/proto/worker/v1;workerv1";
+
+// WorkerService defines the internal gRPC contract between the Orchestrator Engine and Domain Workers.
+service WorkerService {
+  // ExecuteStep triggers the forward action of a Saga step (e.g., ChargeCard, ReserveItems, GenerateShippingLabel, SendEmail).
+  rpc ExecuteStep (StepRequest) returns (StepResponse);
+
+  // CompensateStep triggers the rollback/compensation action of a Saga step (e.g., RefundCard, ReleaseItems, VoidLabel).
+  rpc CompensateStep (StepRequest) returns (StepResponse);
+}
+
+message StepRequest {
+  string workflow_id = 1;
+  string step_name   = 2;
+  string action      = 3;
+  bytes  payload     = 4;
+}
+
+message StepResponse {
+  bool   success       = 1;
+  bytes  output        = 2;
+  string error_message = 3;
+}
