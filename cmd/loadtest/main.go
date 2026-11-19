@@ -28,43 +28,32 @@ type checkoutResp struct {
 	Status     string `json:"status"`
 }
 
+type domainStateSummary struct {
+	TotalChargedCount    int     `json:"total_charged_transactions"`
+	TotalRefundedCount   int     `json:"total_refunded_transactions"`
+	NetCapturedRevenue   float64 `json:"net_captured_revenue"`
+	TotalLabelsGenerated int     `json:"total_labels_generated"`
+	TotalLabelsVoided    int     `json:"total_labels_voided"`
+	TotalEmailsSent      int     `json:"total_emails_sent"`
+	InventoryCatalog     []struct {
+		SKU            string `json:"sku"`
+		AvailableStock int    `json:"available_stock"`
+		ReservedStock  int    `json:"reserved_stock"`
+	} `json:"inventory_catalog"`
+}
+
 func main() {
 	baseURL := flag.String("url", "http://localhost:8080", "Base URL of the Edge API Gateway")
 	concurrency := flag.Int("concurrency", 25, "Number of concurrent load-generating goroutines")
 	duration := flag.Duration("duration", 30*time.Second, "Total duration of the stress test")
 	numClients := flag.Int("clients", 15, "Number of distinct X-API-Key clients to simulate")
-	rollbackRate := flag.Float64("rollback-rate", 0.20, "Probability (0.0-1.0) of triggering a Saga Rollback (Fulfillment/Inventory failure)")
+	rollbackRate := flag.Float64("rollback-rate", 0.20, "Probability (0.0-1.0) of triggering a Saga Rollback (Real stock/carrier failure)")
 	dlqRate := flag.Float64("dlq-rate", 0.10, "Probability (0.0-1.0) of triggering Notification failure (Retries + DLQ)")
 	thinkTime := flag.Duration("think-time", 40*time.Millisecond, "Delay between requests per worker (set 0s for max saturation)")
 	flag.Parse()
 
 	endpoint := *baseURL + "/api/v1/workflows/checkout"
-
-	fmt.Println("================================================================================")
-	fmt.Println(" 🚀 DISTRIBUTED WORKFLOW ORCHESTRATOR - STRESS & LOAD TESTER")
-	fmt.Println("================================================================================")
-	fmt.Printf(" Target Endpoint : %s\n", endpoint)
-	fmt.Printf(" Concurrency     : %d goroutines\n", *concurrency)
-	fmt.Printf(" Duration        : %v\n", *duration)
-	fmt.Printf(" Simulated Keys  : %d API keys\n", *numClients)
-	fmt.Printf(" Rollback Ratio  : %.0f%% (Fulfillment/Inventory compensation stress)\n", *rollbackRate*100)
-	fmt.Printf(" DLQ Ratio       : %.0f%% (Notification retry + DLQ stress)\n", *dlqRate*100)
-	fmt.Printf(" Think Time      : %v\n", *thinkTime)
-	fmt.Println("================================================================================")
-
-	var (
-		totalReqs       atomic.Int64
-		status202       atomic.Int64
-		status429       atomic.Int64
-		statusOther     atomic.Int64
-		sagaCompleted   atomic.Int64
-		sagaRolledBack  atomic.Int64
-		sagaTriggeredDLQ atomic.Int64
-		networkErrors   atomic.Int64
-
-		latMu     sync.Mutex
-		latencies = make([]time.Duration, 0, 10000)
-	)
+	catalogSKUs := []string{"keyboard_mech", "mouse_wireless", "monitor_4k", "gpu_rtx", "psu_850w", "headset"}
 
 	httpClient := &http.Client{
 		Timeout: 15 * time.Second,
@@ -74,6 +63,44 @@ func main() {
 			IdleConnTimeout:     60 * time.Second,
 		},
 	}
+
+	// Pre-seed ample warehouse stock for catalog items before stress test
+	for _, sku := range catalogSKUs {
+		restockBody, _ := json.Marshal(map[string]interface{}{"sku": sku, "quantity": 50000})
+		req, err := http.NewRequest(http.MethodPost, *baseURL+"/api/v1/domain/inventory/restock", bytes.NewReader(restockBody))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			if resp, doErr := httpClient.Do(req); doErr == nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}
+
+	fmt.Println("================================================================================")
+	fmt.Println(" DISTRIBUTED WORKFLOW ORCHESTRATOR - STATEFUL DOMAIN STRESS & LOAD TESTER")
+	fmt.Println("================================================================================")
+	fmt.Printf(" Target Endpoint : %s\n", endpoint)
+	fmt.Printf(" Concurrency     : %d goroutines\n", *concurrency)
+	fmt.Printf(" Duration        : %v\n", *duration)
+	fmt.Printf(" Simulated Keys  : %d API keys\n", *numClients)
+	fmt.Printf(" Rollback Ratio  : %.0f%% (Real Prohibited Parcel & Out-of-Stock SKU rollbacks)\n", *rollbackRate*100)
+	fmt.Printf(" DLQ Ratio       : %.0f%% (Invalid recipient SMTP retry + DLQ stress)\n", *dlqRate*100)
+	fmt.Printf(" Think Time      : %v\n", *thinkTime)
+	fmt.Println("================================================================================")
+
+	var (
+		totalReqs        atomic.Int64
+		status202        atomic.Int64
+		status429        atomic.Int64
+		statusOther      atomic.Int64
+		sagaCompleted    atomic.Int64
+		sagaRolledBack   atomic.Int64
+		sagaTriggeredDLQ atomic.Int64
+		networkErrors    atomic.Int64
+
+		latMu     sync.Mutex
+		latencies = make([]time.Duration, 0, 10000)
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
@@ -115,27 +142,32 @@ func main() {
 				clientID := rng.Intn(*numClients) + 1
 				apiKey := fmt.Sprintf("stress-client-%02d", clientID)
 
-				// Decide scenario for this request
-				var failStep string
+				sku1 := catalogSKUs[rng.Intn(len(catalogSKUs))]
+				sku2 := catalogSKUs[rng.Intn(len(catalogSKUs))]
+				items := []string{sku1, sku2}
+				customerID := fmt.Sprintf("cust_%d_%d", workerID, rng.Intn(10000))
+
 				isDLQ := false
 				roll := rng.Float64()
 				if roll < *rollbackRate {
-					if rng.Float64() < 0.75 {
-						failStep = "Fulfillment"
+					if rng.Float64() < 0.70 {
+						// Real Fulfillment rejection: prohibited hazard item triggers ReleaseItems + RefundCard
+						items = append(items, "restricted_hazard_item")
 					} else {
-						failStep = "Inventory"
+						// Real Inventory shortage: 0-stock SKU triggers RefundCard
+						items = append(items, "out_of_stock_item")
 					}
 				} else if roll < (*rollbackRate + *dlqRate) {
-					failStep = "Notification"
+					// Real Notification failure: unsubscribed recipient triggers 3x backoff + DLQ
+					customerID = "unsubscribed_customer"
 					isDLQ = true
 				}
 
 				payload := checkoutReq{
-					CustomerID:       fmt.Sprintf("cust_%d_%d", workerID, rng.Intn(10000)),
-					Amount:           float64(50 + rng.Intn(950)),
-					Currency:         "BRL",
-					Items:            []string{"item_alpha", "item_beta"},
-					SimulateFailStep: failStep,
+					CustomerID: customerID,
+					Amount:     float64(50 + rng.Intn(450)),
+					Currency:   "BRL",
+					Items:      items,
 				}
 				bodyBytes, _ := json.Marshal(payload)
 
@@ -224,7 +256,7 @@ func main() {
 	rps := float64(tot) / totalElapsed.Seconds()
 
 	fmt.Println("\n================================================================================")
-	fmt.Println(" 📊 FINAL STRESS TEST REPORT")
+	fmt.Println(" FINAL STRESS TEST REPORT")
 	fmt.Println("================================================================================")
 	fmt.Printf(" Total Elapsed Time          : %v\n", totalElapsed.Round(time.Millisecond))
 	fmt.Printf(" Total HTTP Requests         : %d\n", tot)
@@ -245,6 +277,20 @@ func main() {
 	fmt.Printf("   Min : %-10v | Avg : %-10v | Max : %-10v\n", minLat.Round(time.Microsecond), avgLat.Round(time.Microsecond), maxLat.Round(time.Microsecond))
 	fmt.Printf("   P50 : %-10v | P90 : %-10v | P95 : %-10v | P99 : %-10v\n",
 		p50.Round(time.Microsecond), p90.Round(time.Microsecond), p95.Round(time.Microsecond), p99.Round(time.Microsecond))
+
+	// Fetch live Domain Store snapshot to show real persisted financial & inventory state
+	if domResp, err := httpClient.Get(*baseURL + "/api/v1/domain/state"); err == nil {
+		defer domResp.Body.Close()
+		var ds domainStateSummary
+		if json.NewDecoder(domResp.Body).Decode(&ds) == nil {
+			fmt.Println("--------------------------------------------------------------------------------")
+			fmt.Println(" Persisted Domain Store State (GET /api/v1/domain/state):")
+			fmt.Printf("   Payment Ledger Charged    : %d transactions (Net Captured: %.2f BRL)\n", ds.TotalChargedCount, ds.NetCapturedRevenue)
+			fmt.Printf("   Payment Ledger Refunded   : %d compensated transactions\n", ds.TotalRefundedCount)
+			fmt.Printf("   Shipping Labels Generated : %d (Voided: %d)\n", ds.TotalLabelsGenerated, ds.TotalLabelsVoided)
+			fmt.Printf("   Confirmation Emails Sent  : %d persisted in outbox\n", ds.TotalEmailsSent)
+		}
+	}
 	fmt.Println("================================================================================")
 }
 

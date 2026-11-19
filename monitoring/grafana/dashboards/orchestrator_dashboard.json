@@ -281,6 +281,70 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 13,
+      "title": "Domain Payment Ledger Volume: Charged vs Refunded [BRL]",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (operation) (orchestrator_domain_payment_volume_total)",
+          "legendFormat": "Total {{operation}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyBRL",
+          "custom": { "fillOpacity": 20, "lineWidth": 2 }
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Domain Inventory Catalog: Units Reserved vs Restored on Rollback",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (operation) (rate(orchestrator_domain_inventory_units_total[15s]))",
+          "legendFormat": "Units {{operation}}/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "fillOpacity": 20, "lineWidth": 2 }
+        }
+      }
+    },
+    {
+      "id": 15,
+      "title": "Domain Fulfillment Shipments & Notification Emails Persisted",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (status) (orchestrator_domain_shipments_total)",
+          "legendFormat": "Shipments ({{status}})",
+          "refId": "A"
+        },
+        {
+          "expr": "orchestrator_domain_notifications_sent_total",
+          "legendFormat": "Emails Sent (Outbox)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 15, "lineWidth": 2 }
+        }
+      }
     }
   ],
   "refresh": "5s",
@@ -290,5 +354,5 @@
   "time": { "from": "now-15m", "to": "now" },
   "title": "Distributed Saga Orchestrator & Edge Rate Limiter",
   "uid": "distributed-saga-orchestrator",
-  "version": 1
+  "version": 2
 }

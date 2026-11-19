@@ -12,6 +12,7 @@ import (
 	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/limiter"
 	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
 	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/orchestrator"
+	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/worker"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -34,6 +35,19 @@ type CheckoutResponse struct {
 	CreatedAt     time.Time                    `json:"created_at"`
 }
 
+// RestockRequest represents a request to add stock for a SKU.
+type RestockRequest struct {
+	SKU      string `json:"sku"`
+	Quantity int    `json:"quantity"`
+}
+
+// BalanceUpdateRequest represents a request to set a customer's payment balance.
+type BalanceUpdateRequest struct {
+	CustomerID string  `json:"customer_id"`
+	Balance    float64 `json:"balance"`
+	Currency   string  `json:"currency"`
+}
+
 // ErrorResponse standardizes error responses.
 type ErrorResponse struct {
 	Error             string `json:"error"`
@@ -43,8 +57,9 @@ type ErrorResponse struct {
 
 // Handler handles Edge API Gateway routes.
 type Handler struct {
-	limiter *limiter.TokenBucketLimiter
-	engine  *orchestrator.Engine
+	limiter     *limiter.TokenBucketLimiter
+	engine      *orchestrator.Engine
+	domainStore worker.DomainStore
 }
 
 // NewHandler creates a new gateway Handler.
@@ -55,11 +70,22 @@ func NewHandler(l *limiter.TokenBucketLimiter) *Handler {
 }
 
 // NewHandlerWithEngine creates a new gateway Handler wired to the Orchestrator Engine.
-func NewHandlerWithEngine(l *limiter.TokenBucketLimiter, engine *orchestrator.Engine) *Handler {
-	return &Handler{
-		limiter: l,
-		engine:  engine,
+func NewHandlerWithEngine(l *limiter.TokenBucketLimiter, engine *orchestrator.Engine, stores ...worker.DomainStore) *Handler {
+	var ds worker.DomainStore
+	if len(stores) > 0 {
+		ds = stores[0]
 	}
+	return &Handler{
+		limiter:     l,
+		engine:      engine,
+		domainStore: ds,
+	}
+}
+
+// WithDomainStore attaches a DomainStore to the Gateway Handler for domain state inspection endpoints.
+func (h *Handler) WithDomainStore(ds worker.DomainStore) *Handler {
+	h.domainStore = ds
+	return h
 }
 
 // RegisterRoutes registers HTTP routes onto a standard http.ServeMux.
@@ -68,6 +94,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", h.HealthCheck)
 	mux.HandleFunc("POST /api/v1/workflows/checkout", h.HandleCheckout)
 	mux.HandleFunc("GET /api/v1/workflows/{id}", h.HandleGetWorkflow)
+	mux.HandleFunc("GET /api/v1/domain/state", h.HandleGetDomainState)
+	mux.HandleFunc("POST /api/v1/domain/inventory/restock", h.HandleRestockProduct)
+	mux.HandleFunc("POST /api/v1/domain/accounts/balance", h.HandleSetCustomerBalance)
 }
 
 // HealthCheck provides service health status.
@@ -219,6 +248,90 @@ func (h *Handler) HandleGetWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	recordHTTP(http.StatusOK)
 	writeJSON(w, http.StatusOK, state)
+}
+
+// HandleGetDomainState returns a live snapshot of inventory stock, payment ledger, shipments, and notifications.
+func (h *Handler) HandleGetDomainState(w http.ResponseWriter, r *http.Request) {
+	if h.domainStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "Service Unavailable",
+			Message: "DomainStore is not attached",
+		})
+		return
+	}
+
+	snapshot, err := h.domainStore.GetDomainSnapshot(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "Internal Server Error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+// HandleRestockProduct adds available stock units to a product SKU.
+func (h *Handler) HandleRestockProduct(w http.ResponseWriter, r *http.Request) {
+	if h.domainStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "Service Unavailable",
+			Message: "DomainStore is not attached",
+		})
+		return
+	}
+
+	var req RestockRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SKU == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "Bad Request",
+			Message: "Invalid restock payload (requires sku and quantity)",
+		})
+		return
+	}
+
+	if err := h.domainStore.RestockProduct(r.Context(), req.SKU, req.Quantity); err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "Internal Server Error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	prod, _ := h.domainStore.GetProductStock(r.Context(), req.SKU)
+	writeJSON(w, http.StatusOK, prod)
+}
+
+// HandleSetCustomerBalance configures a customer's payment wallet/credit balance.
+func (h *Handler) HandleSetCustomerBalance(w http.ResponseWriter, r *http.Request) {
+	if h.domainStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error:   "Service Unavailable",
+			Message: "DomainStore is not attached",
+		})
+		return
+	}
+
+	var req BalanceUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.CustomerID == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "Bad Request",
+			Message: "Invalid balance update payload (requires customer_id and balance)",
+		})
+		return
+	}
+
+	if err := h.domainStore.SetCustomerBalance(r.Context(), req.CustomerID, req.Balance, req.Currency); err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
+			Error:   "Internal Server Error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	acc, _ := h.domainStore.GetCustomerAccount(r.Context(), req.CustomerID)
+	writeJSON(w, http.StatusOK, acc)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {

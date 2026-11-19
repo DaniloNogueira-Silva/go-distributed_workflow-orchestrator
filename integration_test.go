@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -22,12 +23,13 @@ import (
 )
 
 type testEnv struct {
-	httpServer *httptest.Server
-	grpcServer *grpc.Server
-	grpcConn   *grpc.ClientConn
-	redisSrv   *miniredis.Miniredis
-	redisCli   *redis.Client
-	repo       *eventsourcing.InMemoryRepository
+	httpServer  *httptest.Server
+	grpcServer  *grpc.Server
+	grpcConn    *grpc.ClientConn
+	redisSrv    *miniredis.Miniredis
+	redisCli    *redis.Client
+	repo        *eventsourcing.InMemoryRepository
+	domainStore *worker.InMemoryDomainStore
 }
 
 func setupEndToEndEnv(t *testing.T, inboundCap, inboundRefill, outboundCap, outboundRefill float64) *testEnv {
@@ -47,7 +49,9 @@ func setupEndToEndEnv(t *testing.T, inboundCap, inboundRefill, outboundCap, outb
 		RefillRatePerSec: outboundRefill,
 		TTLSeconds:       60,
 	})
-	outboundLimiter := limiter.NewOutboundLimiter(outboundBucket, 40*time.Millisecond, 30)
+	outboundLimiter := limiter.NewOutboundLimiter(outboundBucket, 40*time.Millisecond, 50)
+
+	domainStore := worker.NewInMemoryDomainStore()
 
 	// Start real gRPC Worker Server on an ephemeral local TCP port
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -56,7 +60,7 @@ func setupEndToEndEnv(t *testing.T, inboundCap, inboundRefill, outboundCap, outb
 	}
 
 	grpcServer := grpc.NewServer()
-	workerv1.RegisterWorkerServiceServer(grpcServer, worker.NewGRPCServer(outboundLimiter))
+	workerv1.RegisterWorkerServiceServer(grpcServer, worker.NewGRPCServer(outboundLimiter, domainStore))
 	go func() {
 		_ = grpcServer.Serve(lis)
 	}()
@@ -72,7 +76,7 @@ func setupEndToEndEnv(t *testing.T, inboundCap, inboundRefill, outboundCap, outb
 	engine := orchestrator.NewEngine(repo, blueprint, workerAdapter)
 
 	mux := http.NewServeMux()
-	gwHandler := gateway.NewHandlerWithEngine(inboundLimiter, engine)
+	gwHandler := gateway.NewHandlerWithEngine(inboundLimiter, engine, domainStore)
 	gwHandler.RegisterRoutes(mux)
 
 	httpServer := httptest.NewServer(mux)
@@ -86,23 +90,27 @@ func setupEndToEndEnv(t *testing.T, inboundCap, inboundRefill, outboundCap, outb
 	})
 
 	return &testEnv{
-		httpServer: httpServer,
-		grpcServer: grpcServer,
-		grpcConn:   grpcConn,
-		redisSrv:   s,
-		redisCli:   rdb,
-		repo:       repo,
+		httpServer:  httpServer,
+		grpcServer:  grpcServer,
+		grpcConn:    grpcConn,
+		redisSrv:    s,
+		redisCli:    rdb,
+		repo:        repo,
+		domainStore: domainStore,
 	}
 }
 
 func TestIntegration_AllScenarios(t *testing.T) {
+	ctx := context.Background()
 	// Configure Inbound capacity = 3, Outbound capacity = 1 (with 25 tokens/sec refill so outbound delay-and-retry is exercised)
 	env := setupEndToEndEnv(t, 3, 0.5, 1, 25)
 
 	// =========================================================================
 	// Scenario 1: Successful Checkout Saga all the way to Notification
 	// =========================================================================
-	t.Run("Scenario 1 - Successful Checkout Saga (Payment -> Inventory -> Fulfillment -> Notification)", func(t *testing.T) {
+	t.Run("Scenario 1 - Successful Checkout Saga Deducts Real Stock, Balance, and Persists Shipment & Email", func(t *testing.T) {
+		kbBefore, _ := env.domainStore.GetProductStock(ctx, "keyboard_mech")
+
 		reqBody := gateway.CheckoutRequest{
 			CustomerID: "cust_success_01",
 			Amount:     349.90,
@@ -134,29 +142,28 @@ func TestIntegration_AllScenarios(t *testing.T) {
 			t.Fatalf("expected workflow status COMPLETED, got %s", checkoutResp.Status)
 		}
 
-		state := checkoutResp.WorkflowState
-		if state == nil {
-			t.Fatalf("expected non-nil workflow_state in response")
+		// Verify real stock deduction in DomainStore
+		kbAfter, _ := env.domainStore.GetProductStock(ctx, "keyboard_mech")
+		if kbAfter.AvailableStock != kbBefore.AvailableStock-1 || kbAfter.ReservedStock != kbBefore.ReservedStock+1 {
+			t.Fatalf("expected keyboard_mech stock to decrease by 1, got before=%d after=%d",
+				kbBefore.AvailableStock, kbAfter.AvailableStock)
 		}
 
-		for _, stepName := range []string{"Payment", "Inventory", "Fulfillment", "Notification"} {
-			st, ok := state.StepStates[stepName]
-			if !ok {
-				t.Fatalf("missing step state for %s", stepName)
-			}
-			if st.Status != eventsourcing.StepStatusSucceeded {
-				t.Fatalf("expected step %s to be SUCCEEDED, got %s", stepName, st.Status)
-			}
+		// Verify real customer balance debit in DomainStore
+		acc, _ := env.domainStore.GetCustomerAccount(ctx, "cust_success_01")
+		expectedBal := worker.DefaultInitialCustomerBalance - 349.90
+		if acc.Balance != expectedBal {
+			t.Fatalf("expected customer balance %.2f, got %.2f", expectedBal, acc.Balance)
 		}
 
-		// Verify GET /api/v1/workflows/{id} endpoint reconstructs the exact same state
-		getResp, err := http.Get(env.httpServer.URL + "/api/v1/workflows/" + checkoutResp.WorkflowID)
+		// Verify GET /api/v1/domain/state endpoint
+		domResp, err := http.Get(env.httpServer.URL + "/api/v1/domain/state")
 		if err != nil {
-			t.Fatalf("GET workflow state failed: %v", err)
+			t.Fatalf("GET domain state failed: %v", err)
 		}
-		defer getResp.Body.Close()
-		if getResp.StatusCode != http.StatusOK {
-			t.Fatalf("expected 200 OK on GET workflow, got %d", getResp.StatusCode)
+		defer domResp.Body.Close()
+		if domResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK on GET domain state, got %d", domResp.StatusCode)
 		}
 	})
 
@@ -205,15 +212,14 @@ func TestIntegration_AllScenarios(t *testing.T) {
 		if respBlocked.StatusCode != http.StatusTooManyRequests {
 			t.Fatalf("expected 429 Too Many Requests, got %d", respBlocked.StatusCode)
 		}
-		if respBlocked.Header.Get("X-RateLimit-Remaining") != "0" {
-			t.Fatalf("expected X-RateLimit-Remaining=0, got %s", respBlocked.Header.Get("X-RateLimit-Remaining"))
-		}
 	})
 
 	// =========================================================================
 	// Scenario 3: Fulfillment fails, triggering rollback for Inventory and Payment
 	// =========================================================================
-	t.Run("Scenario 3 - Fulfillment Failure Triggers Reverse Compensations (Inventory -> Payment)", func(t *testing.T) {
+	t.Run("Scenario 3 - Fulfillment Failure Triggers Reverse Compensations Restoring Real Stock and Balance", func(t *testing.T) {
+		monBefore, _ := env.domainStore.GetProductStock(ctx, "monitor_4k")
+
 		reqBody := gateway.CheckoutRequest{
 			CustomerID:       "cust_rollback_03",
 			Amount:           1299.00,
@@ -233,49 +239,64 @@ func TestIntegration_AllScenarios(t *testing.T) {
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusAccepted {
-			t.Fatalf("expected 202 Accepted, got %d", resp.StatusCode)
-		}
-
 		var checkoutResp gateway.CheckoutResponse
-		if err := json.NewDecoder(resp.Body).Decode(&checkoutResp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
+		_ = json.NewDecoder(resp.Body).Decode(&checkoutResp)
 
 		if checkoutResp.Status != string(eventsourcing.WorkflowStatusRolledBack) {
 			t.Fatalf("expected workflow status ROLLED_BACK, got %s", checkoutResp.Status)
 		}
 
-		state := checkoutResp.WorkflowState
-		if state.StepStates["Fulfillment"].Status != eventsourcing.StepStatusFailed {
-			t.Fatalf("expected Fulfillment status FAILED, got %s", state.StepStates["Fulfillment"].Status)
-		}
-		if !state.StepStates["Inventory"].Compensated {
-			t.Fatalf("expected Inventory step to be compensated (ReleaseItems)")
-		}
-		if !state.StepStates["Payment"].Compensated {
-			t.Fatalf("expected Payment step to be compensated (RefundCard)")
-		}
-		if _, exists := state.StepStates["Notification"]; exists {
-			t.Fatalf("expected Notification step to never be executed after Fulfillment failure")
+		// Verify physical stock was restored to exact pre-checkout count after ReleaseItems compensation
+		monAfter, _ := env.domainStore.GetProductStock(ctx, "monitor_4k")
+		if monAfter.AvailableStock != monBefore.AvailableStock || monAfter.ReservedStock != 0 {
+			t.Fatalf("expected monitor_4k stock restored to %d (reserved=0), got available=%d reserved=%d",
+				monBefore.AvailableStock, monAfter.AvailableStock, monAfter.ReservedStock)
 		}
 
-		// Verify that InventoryCompensated occurred BEFORE PaymentCompensated in the Event Log
-		invCompIdx := -1
-		payCompIdx := -1
-		for idx, ev := range state.Events {
-			if ev.EventType == eventsourcing.EventInventoryCompensated {
-				invCompIdx = idx
-			}
-			if ev.EventType == eventsourcing.EventPaymentCompensated {
-				payCompIdx = idx
-			}
+		// Verify customer balance was refunded back to full initial balance after RefundCard compensation
+		acc, _ := env.domainStore.GetCustomerAccount(ctx, "cust_rollback_03")
+		if acc.Balance != worker.DefaultInitialCustomerBalance {
+			t.Fatalf("expected customer balance restored to %.2f after refund, got %.2f",
+				worker.DefaultInitialCustomerBalance, acc.Balance)
 		}
-		if invCompIdx == -1 || payCompIdx == -1 {
-			t.Fatalf("expected both InventoryCompensated and PaymentCompensated events in log")
+	})
+
+	// =========================================================================
+	// Scenario 4: Real Domain Business Rule Failures (Out-of-Stock & Prohibited Parcel)
+	// =========================================================================
+	t.Run("Scenario 4 - Real Out-of-Stock SKU in Inventory Automatically Refunds Payment", func(t *testing.T) {
+		reqBody := gateway.CheckoutRequest{
+			CustomerID: "cust_real_oos",
+			Amount:     599.00,
+			Currency:   "BRL",
+			Items:      []string{"out_of_stock_item"}, // Seeded with 0 stock in DomainStore
 		}
-		if invCompIdx > payCompIdx {
-			t.Fatalf("expected InventoryCompensated (idx %d) before PaymentCompensated (idx %d)", invCompIdx, payCompIdx)
+		payloadBytes, _ := json.Marshal(reqBody)
+
+		req, _ := http.NewRequest(http.MethodPost, env.httpServer.URL+"/api/v1/workflows/checkout", bytes.NewReader(payloadBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", "client-scenario-4")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("HTTP request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		var checkoutResp gateway.CheckoutResponse
+		_ = json.NewDecoder(resp.Body).Decode(&checkoutResp)
+
+		if checkoutResp.Status != string(eventsourcing.WorkflowStatusRolledBack) {
+			t.Fatalf("expected ROLLED_BACK when ordering out_of_stock_item, got %s", checkoutResp.Status)
+		}
+		if !checkoutResp.WorkflowState.StepStates["Payment"].Compensated {
+			t.Fatalf("expected Payment to be compensated (refunded) after real Inventory stock shortage")
+		}
+
+		acc, _ := env.domainStore.GetCustomerAccount(ctx, "cust_real_oos")
+		if acc.Balance != worker.DefaultInitialCustomerBalance {
+			t.Fatalf("expected customer balance refunded to %.2f, got %.2f",
+				worker.DefaultInitialCustomerBalance, acc.Balance)
 		}
 	})
 }

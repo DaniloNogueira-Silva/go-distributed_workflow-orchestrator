@@ -80,4 +80,28 @@ var (
 		Name: "orchestrator_events_persisted_total",
 		Help: "Total number of Event Sourcing events persisted by event_type.",
 	}, []string{"event_type"})
+
+	// DomainPaymentVolumeTotal tracks monetary volume charged and refunded in the Payment Ledger.
+	DomainPaymentVolumeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "orchestrator_domain_payment_volume_total",
+		Help: "Cumulative monetary volume processed by the Payment Worker (charged vs refunded).",
+	}, []string{"operation"})
+
+	// DomainInventoryUnitsTotal tracks physical product units reserved and released in the Inventory Service.
+	DomainInventoryUnitsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "orchestrator_domain_inventory_units_total",
+		Help: "Total product units reserved and released in the Inventory Catalog.",
+	}, []string{"operation"})
+
+	// DomainShipmentsTotal tracks shipping labels generated and voided in the Fulfillment Service.
+	DomainShipmentsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "orchestrator_domain_shipments_total",
+		Help: "Total shipping labels generated and voided by the Fulfillment Worker.",
+	}, []string{"status"})
+
+	// DomainNotificationsSentTotal tracks transactional emails persisted to the Notification Outbox.
+	DomainNotificationsSentTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "orchestrator_domain_notifications_sent_total",
+		Help: "Total transactional confirmation emails persisted to the Notification Outbox.",
+	})
 )

@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/limiter"
-	"github.com/google/uuid"
+	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
 )
 
 // CheckoutSagaPayload represents the payload passed across the Checkout Saga steps.
@@ -27,17 +26,20 @@ type StepHandler interface {
 	Compensate(ctx context.Context, workflowID, action string, payload []byte) ([]byte, error)
 }
 
-// PaymentWorker handles card charges and refunds, guarded by an Outbound Rate Limiter.
+// PaymentWorker handles real customer account balance deductions and ledger refunds, guarded by an Outbound Rate Limiter.
 type PaymentWorker struct {
 	outbound *limiter.OutboundLimiter
+	store    DomainStore
 }
 
-func NewPaymentWorker(outbound *limiter.OutboundLimiter) *PaymentWorker {
-	return &PaymentWorker{outbound: outbound}
+func NewPaymentWorker(outbound *limiter.OutboundLimiter, store DomainStore) *PaymentWorker {
+	if store == nil {
+		store = NewInMemoryDomainStore()
+	}
+	return &PaymentWorker{outbound: outbound, store: store}
 }
 
 func (w *PaymentWorker) Execute(ctx context.Context, workflowID, action string, payload []byte) ([]byte, error) {
-	// Check Outbound Rate Limiter before calling external Payment Gateway API
 	delayed, err := w.outbound.Acquire(ctx, "payment_gateway")
 	if err != nil {
 		return nil, err
@@ -50,16 +52,25 @@ func (w *PaymentWorker) Execute(ctx context.Context, workflowID, action string, 
 		return nil, fmt.Errorf("payment gateway declined card for customer %s", data.CustomerID)
 	}
 
-	txID := "pay_" + uuid.NewString()[:8]
-	log.Printf("[PaymentWorker] Charged %.2f %s for customer %s (tx=%s, outbound_delays=%d)",
-		data.Amount, data.Currency, data.CustomerID, txID, delayed)
+	tx, err := w.store.ChargeCustomer(ctx, workflowID, data.CustomerID, data.Amount, data.Currency)
+	if err != nil {
+		return nil, err
+	}
+
+	metrics.DomainPaymentVolumeTotal.WithLabelValues("charged").Add(tx.Amount)
+
+	log.Printf("[PaymentWorker] Charged %.2f %s from customer %s (tx=%s, remaining_balance=%.2f, outbound_delays=%d)",
+		tx.Amount, tx.Currency, tx.CustomerID, tx.ID, tx.RemainingCredit, delayed)
 
 	return json.Marshal(map[string]interface{}{
-		"transaction_id":  txID,
-		"action":          action,
-		"status":          "CHARGED",
-		"outbound_delays": delayed,
-		"processed_at":    time.Now().UTC(),
+		"transaction_id":    tx.ID,
+		"action":            action,
+		"status":            tx.Status,
+		"amount":            tx.Amount,
+		"currency":          tx.Currency,
+		"remaining_balance": tx.RemainingCredit,
+		"outbound_delays":   delayed,
+		"processed_at":      tx.CreatedAt,
 	})
 }
 
@@ -69,27 +80,38 @@ func (w *PaymentWorker) Compensate(ctx context.Context, workflowID, action strin
 		return nil, err
 	}
 
-	var data CheckoutSagaPayload
-	_ = json.Unmarshal(payload, &data)
+	tx, err := w.store.RefundCustomer(ctx, workflowID)
+	if err != nil {
+		return nil, err
+	}
 
-	refundID := "ref_" + uuid.NewString()[:8]
-	log.Printf("[PaymentWorker] COMPENSATED (Refunded %.2f %s) for workflow %s (refund_id=%s, outbound_delays=%d)",
-		data.Amount, data.Currency, workflowID, refundID, delayed)
+	metrics.DomainPaymentVolumeTotal.WithLabelValues("refunded").Add(tx.Amount)
+
+	log.Printf("[PaymentWorker] COMPENSATED (Refunded %.2f %s to customer %s) for workflow %s (refund_id=%s, restored_balance=%.2f, outbound_delays=%d)",
+		tx.Amount, tx.Currency, tx.CustomerID, workflowID, tx.RefundID, tx.RemainingCredit, delayed)
 
 	return json.Marshal(map[string]interface{}{
-		"refund_id":       refundID,
-		"action":          action,
-		"status":          "REFUNDED",
-		"outbound_delays": delayed,
-		"compensated_at":  time.Now().UTC(),
+		"transaction_id":   tx.ID,
+		"refund_id":        tx.RefundID,
+		"action":           action,
+		"status":           tx.Status,
+		"amount_refunded":  tx.Amount,
+		"restored_balance": tx.RemainingCredit,
+		"outbound_delays":  delayed,
+		"compensated_at":   tx.UpdatedAt,
 	})
 }
 
-// InventoryWorker handles item reservations and releases.
-type InventoryWorker struct{}
+// InventoryWorker handles catalog stock reservations and stock restoration on rollback.
+type InventoryWorker struct {
+	store DomainStore
+}
 
-func NewInventoryWorker() *InventoryWorker {
-	return &InventoryWorker{}
+func NewInventoryWorker(store DomainStore) *InventoryWorker {
+	if store == nil {
+		store = NewInMemoryDomainStore()
+	}
+	return &InventoryWorker{store: store}
 }
 
 func (w *InventoryWorker) Execute(ctx context.Context, workflowID, action string, payload []byte) ([]byte, error) {
@@ -100,45 +122,61 @@ func (w *InventoryWorker) Execute(ctx context.Context, workflowID, action string
 		return nil, fmt.Errorf("insufficient stock for items %v", data.Items)
 	}
 
-	resID := "inv_" + uuid.NewString()[:8]
-	log.Printf("[InventoryWorker] Reserved %d items for workflow %s (reservation_id=%s)",
-		len(data.Items), workflowID, resID)
+	res, err := w.store.ReserveStock(ctx, workflowID, data.Items)
+	if err != nil {
+		return nil, err
+	}
+
+	metrics.DomainInventoryUnitsTotal.WithLabelValues("reserved").Add(float64(len(res.Items)))
+
+	log.Printf("[InventoryWorker] Reserved %d item(s) %v for workflow %s (reservation_id=%s, stock_after=%v)",
+		len(res.Items), res.Items, workflowID, res.ID, res.StockAfter)
 
 	return json.Marshal(map[string]interface{}{
-		"reservation_id": resID,
-		"action":         action,
-		"items_reserved": data.Items,
-		"status":         "RESERVED",
-		"processed_at":   time.Now().UTC(),
+		"reservation_id":        res.ID,
+		"action":                action,
+		"items_reserved":        res.Items,
+		"stock_after_operation": res.StockAfter,
+		"status":                res.Status,
+		"processed_at":          res.CreatedAt,
 	})
 }
 
 func (w *InventoryWorker) Compensate(ctx context.Context, workflowID, action string, payload []byte) ([]byte, error) {
-	var data CheckoutSagaPayload
-	_ = json.Unmarshal(payload, &data)
+	res, err := w.store.ReleaseStock(ctx, workflowID)
+	if err != nil {
+		return nil, err
+	}
 
-	log.Printf("[InventoryWorker] COMPENSATED (Released %d reserved items) for workflow %s",
-		len(data.Items), workflowID)
+	metrics.DomainInventoryUnitsTotal.WithLabelValues("released").Add(float64(len(res.Items)))
+
+	log.Printf("[InventoryWorker] COMPENSATED (Restored %d item(s) %v to available stock) for workflow %s (stock_after=%v)",
+		len(res.Items), res.Items, workflowID, res.StockAfter)
 
 	return json.Marshal(map[string]interface{}{
-		"action":         action,
-		"items_released": data.Items,
-		"status":         "RELEASED",
-		"compensated_at": time.Now().UTC(),
+		"reservation_id":        res.ID,
+		"action":                action,
+		"items_released":        res.Items,
+		"stock_after_operation": res.StockAfter,
+		"status":                res.Status,
+		"compensated_at":        res.UpdatedAt,
 	})
 }
 
-// FulfillmentWorker generates and voids shipping labels, guarded by an Outbound Rate Limiter.
+// FulfillmentWorker persists shipping labels and voids them on rollback, guarded by an Outbound Rate Limiter.
 type FulfillmentWorker struct {
 	outbound *limiter.OutboundLimiter
+	store    DomainStore
 }
 
-func NewFulfillmentWorker(outbound *limiter.OutboundLimiter) *FulfillmentWorker {
-	return &FulfillmentWorker{outbound: outbound}
+func NewFulfillmentWorker(outbound *limiter.OutboundLimiter, store DomainStore) *FulfillmentWorker {
+	if store == nil {
+		store = NewInMemoryDomainStore()
+	}
+	return &FulfillmentWorker{outbound: outbound, store: store}
 }
 
 func (w *FulfillmentWorker) Execute(ctx context.Context, workflowID, action string, payload []byte) ([]byte, error) {
-	// Check Outbound Rate Limiter before calling external Shipping Carrier API
 	delayed, err := w.outbound.Acquire(ctx, "shipping_carrier")
 	if err != nil {
 		return nil, err
@@ -151,16 +189,24 @@ func (w *FulfillmentWorker) Execute(ctx context.Context, workflowID, action stri
 		return nil, fmt.Errorf("shipping carrier API error: unable to generate label for workflow %s", workflowID)
 	}
 
-	labelID := "lbl_" + uuid.NewString()[:8]
-	log.Printf("[FulfillmentWorker] Generated shipping label %s for workflow %s (outbound_delays=%d)",
-		labelID, workflowID, delayed)
+	sh, err := w.store.CreateShipment(ctx, workflowID, data.CustomerID, data.Items)
+	if err != nil {
+		return nil, err
+	}
+
+	metrics.DomainShipmentsTotal.WithLabelValues("generated").Inc()
+
+	log.Printf("[FulfillmentWorker] Generated shipping label %s (tracking=%s) for workflow %s (outbound_delays=%d)",
+		sh.ID, sh.TrackingCode, workflowID, delayed)
 
 	return json.Marshal(map[string]interface{}{
-		"shipping_label_id": labelID,
+		"shipping_label_id": sh.ID,
+		"tracking_code":     sh.TrackingCode,
+		"carrier":           sh.Carrier,
 		"action":            action,
-		"status":            "LABEL_GENERATED",
+		"status":            sh.Status,
 		"outbound_delays":   delayed,
-		"processed_at":      time.Now().UTC(),
+		"processed_at":      sh.CreatedAt,
 	})
 }
 
@@ -170,22 +216,36 @@ func (w *FulfillmentWorker) Compensate(ctx context.Context, workflowID, action s
 		return nil, err
 	}
 
-	log.Printf("[FulfillmentWorker] COMPENSATED (Voided shipping label) for workflow %s (outbound_delays=%d)",
-		workflowID, delayed)
+	sh, err := w.store.VoidShipment(ctx, workflowID)
+	if err != nil {
+		return nil, err
+	}
+
+	metrics.DomainShipmentsTotal.WithLabelValues("voided").Inc()
+
+	log.Printf("[FulfillmentWorker] COMPENSATED (Voided shipping label %s) for workflow %s (outbound_delays=%d)",
+		sh.ID, workflowID, delayed)
 
 	return json.Marshal(map[string]interface{}{
-		"action":          action,
-		"status":          "LABEL_VOIDED",
-		"outbound_delays": delayed,
-		"compensated_at":  time.Now().UTC(),
+		"shipping_label_id": sh.ID,
+		"tracking_code":     sh.TrackingCode,
+		"action":            action,
+		"status":            sh.Status,
+		"outbound_delays":   delayed,
+		"compensated_at":    sh.UpdatedAt,
 	})
 }
 
-// NotificationWorker sends transactional emails to customers.
-type NotificationWorker struct{}
+// NotificationWorker formats and persists transactional emails to the notification outbox.
+type NotificationWorker struct {
+	store DomainStore
+}
 
-func NewNotificationWorker() *NotificationWorker {
-	return &NotificationWorker{}
+func NewNotificationWorker(store DomainStore) *NotificationWorker {
+	if store == nil {
+		store = NewInMemoryDomainStore()
+	}
+	return &NotificationWorker{store: store}
 }
 
 func (w *NotificationWorker) Execute(ctx context.Context, workflowID, action string, payload []byte) ([]byte, error) {
@@ -196,20 +256,27 @@ func (w *NotificationWorker) Execute(ctx context.Context, workflowID, action str
 		return nil, fmt.Errorf("SMTP server timeout while sending email to customer %s", data.CustomerID)
 	}
 
-	msgID := "msg_" + uuid.NewString()[:8]
-	log.Printf("[NotificationWorker] Sent checkout confirmation email %s to customer %s",
-		msgID, data.CustomerID)
+	msg, err := w.store.SendNotification(ctx, workflowID, data.CustomerID, data.Amount, data.Currency, data.Items)
+	if err != nil {
+		return nil, err
+	}
+
+	metrics.DomainNotificationsSentTotal.Inc()
+
+	log.Printf("[NotificationWorker] Sent & persisted confirmation email %s to %s (%s)",
+		msg.ID, msg.RecipientEmail, msg.Subject)
 
 	return json.Marshal(map[string]interface{}{
-		"message_id":   msgID,
-		"action":       action,
-		"status":       "EMAIL_SENT",
-		"processed_at": time.Now().UTC(),
+		"message_id":      msg.ID,
+		"recipient_email": msg.RecipientEmail,
+		"subject":         msg.Subject,
+		"action":          action,
+		"status":          msg.Status,
+		"processed_at":    msg.CreatedAt,
 	})
 }
 
 func (w *NotificationWorker) Compensate(ctx context.Context, workflowID, action string, payload []byte) ([]byte, error) {
-	// Non-critical step has no compensation
 	return json.Marshal(map[string]interface{}{
 		"status": "NO_OP",
 	})

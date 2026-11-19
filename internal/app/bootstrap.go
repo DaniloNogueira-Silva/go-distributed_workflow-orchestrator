@@ -25,7 +25,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Run wires and runs the Edge API Gateway, Orchestrator Engine, Event Store, and gRPC Workers.
+// Run wires and runs the Edge API Gateway, Orchestrator Engine, Event Store, Domain Store, and gRPC Workers.
 func Run() {
 	cfg := config.Load()
 
@@ -46,27 +46,35 @@ func Run() {
 		log.Println("[Bootstrap] Connected to Redis.")
 	}
 
-	// 2. Connect to PostgreSQL for Event Sourcing (fallback to InMemoryRepository if unavailable)
+	// 2. Connect to PostgreSQL for Event Sourcing & Worker Domain Tables (fallback to In-Memory if unavailable)
 	var repo eventsourcing.Repository
+	var domainStore worker.DomainStore
+
 	db, err := sql.Open("postgres", cfg.PostgresDSN())
 	if err == nil {
-		dbCtx, dbCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer dbCancel()
 		if pingErr := db.PingContext(dbCtx); pingErr == nil {
 			pgRepo := eventsourcing.NewPostgresRepository(db)
+			pgDomain := worker.NewPostgresDomainStore(db)
+
 			if schemaErr := pgRepo.EnsureSchema(dbCtx); schemaErr != nil {
-				log.Printf("[Bootstrap Warning] Failed to apply Postgres schema: %v", schemaErr)
+				log.Printf("[Bootstrap Warning] Failed to apply Event Sourcing schema: %v", schemaErr)
+			} else if domainErr := pgDomain.EnsureSchemaAndSeed(dbCtx); domainErr != nil {
+				log.Printf("[Bootstrap Warning] Failed to apply Domain Store schema & seed: %v", domainErr)
 			} else {
-				log.Println("[Bootstrap] Connected to PostgreSQL and verified Event Sourcing schema.")
+				log.Println("[Bootstrap] Connected to PostgreSQL (Event Sourcing & Domain Worker tables verified and seeded).")
 				repo = pgRepo
+				domainStore = pgDomain
 			}
 		} else {
-			log.Printf("[Bootstrap Warning] PostgreSQL unavailable (%v). Falling back to In-Memory Event Store.", pingErr)
+			log.Printf("[Bootstrap Warning] PostgreSQL unavailable (%v). Falling back to In-Memory Event & Domain Stores.", pingErr)
 			_ = db.Close()
 		}
 	}
-	if repo == nil {
+	if repo == nil || domainStore == nil {
 		repo = eventsourcing.NewInMemoryRepository()
+		domainStore = worker.NewInMemoryDomainStore()
 	} else if db != nil {
 		defer func() { _ = db.Close() }()
 	}
@@ -85,14 +93,14 @@ func Run() {
 	})
 	outboundLimiter := limiter.NewOutboundLimiter(outboundBucket, 50*time.Millisecond, 200)
 
-	// 4. Start gRPC Worker Server (Payment, Inventory, Fulfillment, Notification)
+	// 4. Start gRPC Worker Server (Payment, Inventory, Fulfillment, Notification backed by DomainStore)
 	grpcListener, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {
 		log.Fatalf("[Bootstrap] Failed to listen on gRPC address %s: %v", cfg.GRPCAddr, err)
 	}
 
 	grpcServer := grpc.NewServer()
-	workerGRPCService := worker.NewGRPCServer(outboundLimiter)
+	workerGRPCService := worker.NewGRPCServer(outboundLimiter, domainStore)
 	workerv1.RegisterWorkerServiceServer(grpcServer, workerGRPCService)
 
 	go func() {
@@ -115,7 +123,7 @@ func Run() {
 
 	// 6. Start Edge API Gateway HTTP Server
 	mux := http.NewServeMux()
-	gwHandler := gateway.NewHandlerWithEngine(inboundLimiter, engine)
+	gwHandler := gateway.NewHandlerWithEngine(inboundLimiter, engine, domainStore)
 	gwHandler.RegisterRoutes(mux)
 
 	httpServer := &http.Server{

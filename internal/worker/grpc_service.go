@@ -15,18 +15,32 @@ import (
 type GRPCServer struct {
 	workerv1.UnimplementedWorkerServiceServer
 	handlers map[string]StepHandler
+	store    DomainStore
 }
 
 // NewGRPCServer constructs a gRPC Worker Server with Payment, Inventory, Fulfillment, and Notification workers.
-func NewGRPCServer(outboundLimiter *limiter.OutboundLimiter) *GRPCServer {
+func NewGRPCServer(outboundLimiter *limiter.OutboundLimiter, stores ...DomainStore) *GRPCServer {
+	var store DomainStore
+	if len(stores) > 0 && stores[0] != nil {
+		store = stores[0]
+	} else {
+		store = NewInMemoryDomainStore()
+	}
+
 	return &GRPCServer{
+		store: store,
 		handlers: map[string]StepHandler{
-			"Payment":      NewPaymentWorker(outboundLimiter),
-			"Inventory":    NewInventoryWorker(),
-			"Fulfillment":  NewFulfillmentWorker(outboundLimiter),
-			"Notification": NewNotificationWorker(),
+			"Payment":      NewPaymentWorker(outboundLimiter, store),
+			"Inventory":    NewInventoryWorker(store),
+			"Fulfillment":  NewFulfillmentWorker(outboundLimiter, store),
+			"Notification": NewNotificationWorker(store),
 		},
 	}
+}
+
+// DomainStore returns the backing DomainStore used by the workers.
+func (s *GRPCServer) DomainStore() DomainStore {
+	return s.store
 }
 
 // ExecuteStep handles incoming gRPC ExecuteStep calls from the Orchestrator Engine.
