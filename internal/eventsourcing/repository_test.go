@@ -66,3 +66,31 @@ func TestReplayEvents_SuccessAndRollbackReconstruction(t *testing.T) {
 		t.Fatalf("expected both Inventory and Payment to be marked compensated")
 	}
 }
+
+func BenchmarkReplayEvents_FullCheckoutSaga(b *testing.B) {
+	ctx := context.Background()
+	repo := eventsourcing.NewInMemoryRepository()
+	wfID := "wf_bench_replay"
+	_, _ = repo.CreateWorkflow(ctx, wfID, "CHECKOUT_SAGA", map[string]interface{}{"customer_id": "cust_1", "amount": 250.0})
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventPaymentStarted, "Payment", nil)
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventPaymentSucceeded, "Payment", nil)
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventInventoryStarted, "Inventory", nil)
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventInventorySucceeded, "Inventory", nil)
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventFulfillmentStarted, "Fulfillment", nil)
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventFulfillmentSucceeded, "Fulfillment", nil)
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventNotificationStarted, "Notification", nil)
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventNotificationSucceeded, "Notification", nil)
+	_, _ = repo.AppendEvent(ctx, wfID, eventsourcing.EventWorkflowCompleted, "", nil)
+
+	events, _ := repo.GetEvents(ctx, wfID)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := eventsourcing.ReplayEvents(wfID, events)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
