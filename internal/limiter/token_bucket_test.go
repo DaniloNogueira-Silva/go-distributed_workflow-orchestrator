@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/limiter"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/limiter"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )

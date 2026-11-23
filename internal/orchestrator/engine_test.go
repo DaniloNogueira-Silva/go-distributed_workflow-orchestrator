@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/eventsourcing"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/orchestrator"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/eventsourcing"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/orchestrator"
 )
 
 type mockWorker struct {

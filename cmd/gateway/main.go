@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/app"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/app"
 )
 
 func main() {

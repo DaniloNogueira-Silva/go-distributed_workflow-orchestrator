@@ -8,8 +8,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/eventsourcing"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/eventsourcing"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/metrics"
 )
 
 // WorkerExecutor abstracts the communication with downstream workers (e.g., gRPC Workers).

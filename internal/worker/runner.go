@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/config"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/limiter"
-	workerv1 "github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/proto/worker/v1"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/config"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/limiter"
+	workerv1 "github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/proto/worker/v1"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"

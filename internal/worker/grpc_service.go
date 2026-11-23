@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/limiter"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
-	workerv1 "github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/proto/worker/v1"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/limiter"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/metrics"
+	workerv1 "github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/proto/worker/v1"
 	"google.golang.org/grpc"
 )
 
@@ -99,6 +99,7 @@ func (s *GRPCServer) ExecuteStep(ctx context.Context, req *workerv1.StepRequest)
 	if err != nil {
 		return &workerv1.StepResponse{
 			Success:      false,
+			Output:       output,
 			ErrorMessage: err.Error(),
 		}, nil
 	}
@@ -130,6 +131,7 @@ func (s *GRPCServer) CompensateStep(ctx context.Context, req *workerv1.StepReque
 	if err != nil {
 		return &workerv1.StepResponse{
 			Success:      false,
+			Output:       output,
 			ErrorMessage: err.Error(),
 		}, nil
 	}
@@ -188,37 +190,45 @@ type workerTelemetryOutput struct {
 	OutboundDelays int      `json:"outbound_delays"`
 }
 
-func recordCrossProcessWorkerMetrics(stepName string, isCompensation bool, rawOutput []byte) {
+func recordCrossProcessWorkerMetrics(stepName string, isCompensation bool, succeeded bool, rawOutput []byte) {
 	var out workerTelemetryOutput
-	_ = json.Unmarshal(rawOutput, &out)
+	if len(rawOutput) > 0 {
+		_ = json.Unmarshal(rawOutput, &out)
+	}
 
 	switch stepName {
 	case "Payment":
 		if out.OutboundDelays > 0 {
 			metrics.OutboundRateLimitDelaysTotal.WithLabelValues("payment_gateway").Add(float64(out.OutboundDelays))
 		}
-		if !isCompensation && out.Amount > 0 {
-			metrics.DomainPaymentVolumeTotal.WithLabelValues("charged").Add(out.Amount)
-		} else if isCompensation && out.AmountRefunded > 0 {
-			metrics.DomainPaymentVolumeTotal.WithLabelValues("refunded").Add(out.AmountRefunded)
+		if succeeded {
+			if !isCompensation && out.Amount > 0 {
+				metrics.DomainPaymentVolumeTotal.WithLabelValues("charged").Add(out.Amount)
+			} else if isCompensation && out.AmountRefunded > 0 {
+				metrics.DomainPaymentVolumeTotal.WithLabelValues("refunded").Add(out.AmountRefunded)
+			}
 		}
 	case "Inventory":
-		if !isCompensation && len(out.ItemsReserved) > 0 {
-			metrics.DomainInventoryUnitsTotal.WithLabelValues("reserved").Add(float64(len(out.ItemsReserved)))
-		} else if isCompensation && len(out.ItemsReleased) > 0 {
-			metrics.DomainInventoryUnitsTotal.WithLabelValues("released").Add(float64(len(out.ItemsReleased)))
+		if succeeded {
+			if !isCompensation && len(out.ItemsReserved) > 0 {
+				metrics.DomainInventoryUnitsTotal.WithLabelValues("reserved").Add(float64(len(out.ItemsReserved)))
+			} else if isCompensation && len(out.ItemsReleased) > 0 {
+				metrics.DomainInventoryUnitsTotal.WithLabelValues("released").Add(float64(len(out.ItemsReleased)))
+			}
 		}
 	case "Fulfillment":
 		if out.OutboundDelays > 0 {
 			metrics.OutboundRateLimitDelaysTotal.WithLabelValues("shipping_carrier").Add(float64(out.OutboundDelays))
 		}
-		if !isCompensation {
-			metrics.DomainShipmentsTotal.WithLabelValues("generated").Inc()
-		} else {
-			metrics.DomainShipmentsTotal.WithLabelValues("voided").Inc()
+		if succeeded {
+			if !isCompensation {
+				metrics.DomainShipmentsTotal.WithLabelValues("generated").Inc()
+			} else {
+				metrics.DomainShipmentsTotal.WithLabelValues("voided").Inc()
+			}
 		}
 	case "Notification":
-		if !isCompensation {
+		if succeeded && !isCompensation {
 			metrics.DomainNotificationsSentTotal.Inc()
 		}
 	}
@@ -241,10 +251,11 @@ func (a *GRPCClientAdapter) ExecuteStep(ctx context.Context, workflowID, stepNam
 		return nil, fmt.Errorf("gRPC ExecuteStep transport error (%s): %w", stepName, err)
 	}
 	if !resp.Success {
+		recordCrossProcessWorkerMetrics(stepName, false, false, resp.Output)
 		return nil, errors.New(resp.ErrorMessage)
 	}
 
-	recordCrossProcessWorkerMetrics(stepName, false, resp.Output)
+	recordCrossProcessWorkerMetrics(stepName, false, true, resp.Output)
 	return json.RawMessage(resp.Output), nil
 }
 
@@ -265,9 +276,10 @@ func (a *GRPCClientAdapter) CompensateStep(ctx context.Context, workflowID, step
 		return nil, fmt.Errorf("gRPC CompensateStep transport error (%s): %w", stepName, err)
 	}
 	if !resp.Success {
+		recordCrossProcessWorkerMetrics(stepName, true, false, resp.Output)
 		return nil, errors.New(resp.ErrorMessage)
 	}
 
-	recordCrossProcessWorkerMetrics(stepName, true, resp.Output)
+	recordCrossProcessWorkerMetrics(stepName, true, true, resp.Output)
 	return json.RawMessage(resp.Output), nil
 }

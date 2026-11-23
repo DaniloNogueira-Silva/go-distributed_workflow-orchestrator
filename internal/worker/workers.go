@@ -7,8 +7,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/limiter"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/limiter"
 )
 
 // CheckoutSagaPayload represents the payload passed across the Checkout Saga steps.
@@ -44,20 +43,19 @@ func (w *PaymentWorker) Execute(ctx context.Context, workflowID, action string, 
 	if err != nil {
 		return nil, err
 	}
+	delayMeta, _ := json.Marshal(map[string]interface{}{"outbound_delays": delayed})
 
 	var data CheckoutSagaPayload
 	_ = json.Unmarshal(payload, &data)
 
 	if strings.EqualFold(data.SimulateFailStep, "Payment") {
-		return nil, fmt.Errorf("payment gateway declined card for customer %s", data.CustomerID)
+		return delayMeta, fmt.Errorf("payment gateway declined card for customer %s", data.CustomerID)
 	}
 
 	tx, err := w.store.ChargeCustomer(ctx, workflowID, data.CustomerID, data.Amount, data.Currency)
 	if err != nil {
-		return nil, err
+		return delayMeta, err
 	}
-
-	metrics.DomainPaymentVolumeTotal.WithLabelValues("charged").Add(tx.Amount)
 
 	log.Printf("[PaymentWorker] Charged %.2f %s from customer %s (tx=%s, remaining_balance=%.2f, outbound_delays=%d)",
 		tx.Amount, tx.Currency, tx.CustomerID, tx.ID, tx.RemainingCredit, delayed)
@@ -79,13 +77,12 @@ func (w *PaymentWorker) Compensate(ctx context.Context, workflowID, action strin
 	if err != nil {
 		return nil, err
 	}
+	delayMeta, _ := json.Marshal(map[string]interface{}{"outbound_delays": delayed})
 
 	tx, err := w.store.RefundCustomer(ctx, workflowID)
 	if err != nil {
-		return nil, err
+		return delayMeta, err
 	}
-
-	metrics.DomainPaymentVolumeTotal.WithLabelValues("refunded").Add(tx.Amount)
 
 	log.Printf("[PaymentWorker] COMPENSATED (Refunded %.2f %s to customer %s) for workflow %s (refund_id=%s, restored_balance=%.2f, outbound_delays=%d)",
 		tx.Amount, tx.Currency, tx.CustomerID, workflowID, tx.RefundID, tx.RemainingCredit, delayed)
@@ -127,8 +124,6 @@ func (w *InventoryWorker) Execute(ctx context.Context, workflowID, action string
 		return nil, err
 	}
 
-	metrics.DomainInventoryUnitsTotal.WithLabelValues("reserved").Add(float64(len(res.Items)))
-
 	log.Printf("[InventoryWorker] Reserved %d item(s) %v for workflow %s (reservation_id=%s, stock_after=%v)",
 		len(res.Items), res.Items, workflowID, res.ID, res.StockAfter)
 
@@ -147,8 +142,6 @@ func (w *InventoryWorker) Compensate(ctx context.Context, workflowID, action str
 	if err != nil {
 		return nil, err
 	}
-
-	metrics.DomainInventoryUnitsTotal.WithLabelValues("released").Add(float64(len(res.Items)))
 
 	log.Printf("[InventoryWorker] COMPENSATED (Restored %d item(s) %v to available stock) for workflow %s (stock_after=%v)",
 		len(res.Items), res.Items, workflowID, res.StockAfter)
@@ -181,20 +174,19 @@ func (w *FulfillmentWorker) Execute(ctx context.Context, workflowID, action stri
 	if err != nil {
 		return nil, err
 	}
+	delayMeta, _ := json.Marshal(map[string]interface{}{"outbound_delays": delayed})
 
 	var data CheckoutSagaPayload
 	_ = json.Unmarshal(payload, &data)
 
 	if strings.EqualFold(data.SimulateFailStep, "Fulfillment") {
-		return nil, fmt.Errorf("shipping carrier API error: unable to generate label for workflow %s", workflowID)
+		return delayMeta, fmt.Errorf("shipping carrier API error: unable to generate label for workflow %s", workflowID)
 	}
 
 	sh, err := w.store.CreateShipment(ctx, workflowID, data.CustomerID, data.Items)
 	if err != nil {
-		return nil, err
+		return delayMeta, err
 	}
-
-	metrics.DomainShipmentsTotal.WithLabelValues("generated").Inc()
 
 	log.Printf("[FulfillmentWorker] Generated shipping label %s (tracking=%s) for workflow %s (outbound_delays=%d)",
 		sh.ID, sh.TrackingCode, workflowID, delayed)
@@ -215,13 +207,12 @@ func (w *FulfillmentWorker) Compensate(ctx context.Context, workflowID, action s
 	if err != nil {
 		return nil, err
 	}
+	delayMeta, _ := json.Marshal(map[string]interface{}{"outbound_delays": delayed})
 
 	sh, err := w.store.VoidShipment(ctx, workflowID)
 	if err != nil {
-		return nil, err
+		return delayMeta, err
 	}
-
-	metrics.DomainShipmentsTotal.WithLabelValues("voided").Inc()
 
 	log.Printf("[FulfillmentWorker] COMPENSATED (Voided shipping label %s) for workflow %s (outbound_delays=%d)",
 		sh.ID, workflowID, delayed)
@@ -260,8 +251,6 @@ func (w *NotificationWorker) Execute(ctx context.Context, workflowID, action str
 	if err != nil {
 		return nil, err
 	}
-
-	metrics.DomainNotificationsSentTotal.Inc()
 
 	log.Printf("[NotificationWorker] Sent & persisted confirmation email %s to %s (%s)",
 		msg.ID, msg.RecipientEmail, msg.Subject)

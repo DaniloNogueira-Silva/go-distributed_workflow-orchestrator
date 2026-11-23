@@ -268,7 +268,7 @@ $ go test "-bench=." -benchmem ./internal/eventsourcing
 
 goos: windows
 goarch: amd64
-pkg: github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/eventsourcing
+pkg: github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/eventsourcing
 cpu: 12th Gen Intel(R) Core(TM) i5-12400F
 BenchmarkReplayEvents_FullCheckoutSaga-12    	  506980	      2141 ns/op	    1568 B/op	      20 allocs/op
 PASS

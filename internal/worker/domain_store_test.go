@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/worker"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/worker"
 )
 
 func TestDomainStore_PaymentChargeAndRefundRestoresBalance(t *testing.T) {

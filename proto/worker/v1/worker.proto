@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package worker.v1;
 
-option go_package = "github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/proto/worker/v1;workerv1";
+option go_package = "github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/proto/worker/v1;workerv1";
 
 // WorkerService defines the internal gRPC contract between the Orchestrator Engine and Domain Workers.
 service WorkerService {

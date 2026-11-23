@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/metrics"
 )
 
 // OutboundLimiter wraps TokenBucketLimiter to throttle outbound calls to external third-party APIs

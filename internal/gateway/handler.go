@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/eventsourcing"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/limiter"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/metrics"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/orchestrator"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/worker"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/eventsourcing"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/limiter"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/metrics"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/orchestrator"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/worker"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )

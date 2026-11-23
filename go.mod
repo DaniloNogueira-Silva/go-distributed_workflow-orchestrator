@@ -1,4 +1,4 @@
-module github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator
+module github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator
 
 go 1.27.0
 

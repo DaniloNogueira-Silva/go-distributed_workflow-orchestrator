@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/config"
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/worker"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/config"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/worker"
 )
 
 func main() {

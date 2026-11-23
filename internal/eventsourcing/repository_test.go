@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/eventsourcing"
+	"github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/eventsourcing"
 )
 
 func TestReplayEvents_SuccessAndRollbackReconstruction(t *testing.T) {
@@ -93,4 +93,3 @@ func BenchmarkReplayEvents_FullCheckoutSaga(b *testing.B) {
 		}
 	}
 }
-

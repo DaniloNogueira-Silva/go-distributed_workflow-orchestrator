@@ -1,6 +1,6 @@
 package main
 
-import "github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/app"
+import "github.com/DaniloNogueira-Silva/go-distributed_workflow-orchestrator/internal/app"
 
 func main() {
 	app.Run()
