@@ -105,3 +105,24 @@ var (
 		Help: "Total transactional confirmation emails persisted to the Notification Outbox.",
 	})
 )
+
+func init() {
+	// Pre-initialize label series with 0 so Prometheus exports all time series immediately on startup
+	// and Grafana panels never display "No data".
+	WorkflowsTotal.WithLabelValues("COMPLETED").Add(0)
+	WorkflowsTotal.WithLabelValues("ROLLED_BACK").Add(0)
+
+	OutboundRateLimitDelaysTotal.WithLabelValues("payment_gateway").Add(0)
+	OutboundRateLimitDelaysTotal.WithLabelValues("shipping_carrier").Add(0)
+
+	DomainPaymentVolumeTotal.WithLabelValues("charged").Add(0)
+	DomainPaymentVolumeTotal.WithLabelValues("refunded").Add(0)
+
+	DomainInventoryUnitsTotal.WithLabelValues("reserved").Add(0)
+	DomainInventoryUnitsTotal.WithLabelValues("released").Add(0)
+
+	DomainShipmentsTotal.WithLabelValues("generated").Add(0)
+	DomainShipmentsTotal.WithLabelValues("voided").Add(0)
+
+	DLQMessagesTotal.WithLabelValues("Notification").Add(0)
+}

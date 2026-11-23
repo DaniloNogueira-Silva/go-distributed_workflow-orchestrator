@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -18,19 +19,33 @@ import (
 	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/limiter"
 	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/orchestrator"
 	"github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/internal/worker"
-	workerv1 "github.com/DaniloNogueira-Silva/go-distributed_worflow-orchestrator/proto/worker/v1"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Run wires and runs the Edge API Gateway, Orchestrator Engine, Event Store, Domain Store, and gRPC Workers.
+const workerRoleEnv = "ORCHESTRATOR_WORKER_ROLE"
+
+// Run launches the cluster: if invoked as a worker child process, runs that isolated worker;
+// otherwise starts/connects to the 4 separate worker OS processes and boots the Gateway + Orchestrator.
 func Run() {
+	if role := os.Getenv(workerRoleEnv); role != "" {
+		cfg := config.Load()
+		worker.RunStandaloneWorker(role, cfg.WorkerAddresses()[role])
+		return
+	}
+	RunGateway(true)
+}
+
+// RunGateway boots the Edge API Gateway and Orchestrator Engine, connecting over TCP/gRPC
+// to the 4 isolated worker servers (:50051, :50052, :50053, :50054).
+// When spawnMissingWorkers is true, any worker port not already listening is launched as a separate OS process.
+func RunGateway(spawnMissingWorkers bool) {
 	cfg := config.Load()
 
-	// 1. Connect to Redis for Inbound & Outbound Rate Limiting
-	log.Printf("[Bootstrap] Connecting to Redis at %s...", cfg.RedisAddr)
+	// 1. Connect to Redis for Inbound Rate Limiting
+	log.Printf("[Bootstrap | PID:%d] Connecting to Redis at %s...", os.Getpid(), cfg.RedisAddr)
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisAddr,
 		Password: cfg.RedisPassword,
@@ -46,7 +61,7 @@ func Run() {
 		log.Println("[Bootstrap] Connected to Redis.")
 	}
 
-	// 2. Connect to PostgreSQL for Event Sourcing & Worker Domain Tables (fallback to In-Memory if unavailable)
+	// 2. Connect to PostgreSQL for Event Sourcing & Domain Store inspection
 	var repo eventsourcing.Repository
 	var domainStore worker.DomainStore
 
@@ -79,45 +94,79 @@ func Run() {
 		defer func() { _ = db.Close() }()
 	}
 
-	// 3. Configure Inbound & Outbound Token Bucket Rate Limiters
+	// 3. Configure Inbound Rate Limiter
 	inboundLimiter := limiter.NewTokenBucketLimiter(rdb, limiter.Config{
 		Capacity:         cfg.RateLimitCapacity,
 		RefillRatePerSec: cfg.RateLimitRefill,
 		TTLSeconds:       60,
 	})
 
-	outboundBucket := limiter.NewTokenBucketLimiter(rdb, limiter.Config{
-		Capacity:         cfg.OutboundRateLimitCapacity,
-		RefillRatePerSec: cfg.OutboundRateLimitRefill,
-		TTLSeconds:       60,
-	})
-	outboundLimiter := limiter.NewOutboundLimiter(outboundBucket, 50*time.Millisecond, 200)
+	// 4. Ensure the 4 separate Worker Processes are running (or spawn them as distinct OS processes)
+	workerAddrs := cfg.WorkerAddresses()
+	orderedSteps := []string{"Payment", "Inventory", "Fulfillment", "Notification"}
+	var spawnedProcesses []*exec.Cmd
 
-	// 4. Start gRPC Worker Server (Payment, Inventory, Fulfillment, Notification backed by DomainStore)
-	grpcListener, err := net.Listen("tcp", cfg.GRPCAddr)
-	if err != nil {
-		log.Fatalf("[Bootstrap] Failed to listen on gRPC address %s: %v", cfg.GRPCAddr, err)
+	if spawnMissingWorkers {
+		exePath, exeErr := os.Executable()
+		for _, stepName := range orderedSteps {
+			addr := workerAddrs[stepName]
+			if isTCPPortOpen(addr) {
+				log.Printf("[Bootstrap] Detected external %s worker already listening on %s", stepName, addr)
+				continue
+			}
+			if exeErr != nil {
+				log.Fatalf("[Bootstrap] Cannot determine executable path to spawn worker %s: %v", stepName, exeErr)
+			}
+
+			cmd := exec.Command(exePath)
+			cmd.Env = append(os.Environ(), workerRoleEnv+"="+stepName)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+
+			if startErr := cmd.Start(); startErr != nil {
+				log.Fatalf("[Bootstrap] Failed to spawn isolated OS process for %s worker: %v", stepName, startErr)
+			}
+			spawnedProcesses = append(spawnedProcesses, cmd)
+			log.Printf("[Bootstrap] Spawned isolated OS process for %s worker (Child PID:%d -> %s)",
+				stepName, cmd.Process.Pid, addr)
+		}
+
+		// Wait briefly for spawned worker processes to bind their TCP ports
+		for _, stepName := range orderedSteps {
+			waitForTCPPort(workerAddrs[stepName], 3*time.Second)
+		}
 	}
 
-	grpcServer := grpc.NewServer()
-	workerGRPCService := worker.NewGRPCServer(outboundLimiter, domainStore)
-	workerv1.RegisterWorkerServiceServer(grpcServer, workerGRPCService)
-
-	go func() {
-		log.Printf("[Bootstrap] gRPC Worker Server listening on %s", cfg.GRPCAddr)
-		if serveErr := grpcServer.Serve(grpcListener); serveErr != nil {
-			log.Fatalf("[Bootstrap] gRPC server error: %v", serveErr)
+	defer func() {
+		for _, cmd := range spawnedProcesses {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}
 		}
 	}()
 
-	// 5. Connect Orchestrator Engine to gRPC Workers
-	grpcConn, err := grpc.NewClient(cfg.GRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("[Bootstrap] Failed to create gRPC client connection: %v", err)
-	}
-	defer func() { _ = grpcConn.Close() }()
+	// 5. Dial 4 independent gRPC Client Connections (one per domain worker process)
+	grpcConns := make(map[string]grpc.ClientConnInterface, len(orderedSteps))
+	var rawConns []*grpc.ClientConn
 
-	workerClient := worker.NewGRPCClientAdapter(grpcConn)
+	for _, stepName := range orderedSteps {
+		addr := workerAddrs[stepName]
+		conn, dialErr := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if dialErr != nil {
+			log.Fatalf("[Bootstrap] Failed to dial %s gRPC worker at %s: %v", stepName, addr, dialErr)
+		}
+		grpcConns[stepName] = conn
+		rawConns = append(rawConns, conn)
+		log.Printf("[Bootstrap] Orchestrator wired to %s Worker gRPC endpoint -> %s", stepName, addr)
+	}
+	defer func() {
+		for _, c := range rawConns {
+			_ = c.Close()
+		}
+	}()
+
+	workerClient := worker.NewMultiGRPCClientAdapter(grpcConns)
 	blueprint := orchestrator.NewCheckoutSagaBlueprint(100 * time.Millisecond)
 	engine := orchestrator.NewEngine(repo, blueprint, workerClient)
 
@@ -138,19 +187,37 @@ func Run() {
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[Bootstrap] Edge API Gateway listening on http://localhost:%s", cfg.Port)
+		log.Printf("[Bootstrap | PID:%d] Edge API Gateway listening on http://localhost:%s", os.Getpid(), cfg.Port)
 		if serveErr := httpServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			log.Fatalf("[Bootstrap] HTTP server error: %v", serveErr)
 		}
 	}()
 
 	<-shutdownChan
-	log.Println("[Bootstrap] Shutting down services gracefully...")
+	log.Println("[Bootstrap] Shutting down Gateway and worker processes gracefully...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
 	_ = httpServer.Shutdown(shutdownCtx)
-	grpcServer.GracefulStop()
 	log.Println("[Bootstrap] All services stopped cleanly.")
+}
+
+func isTCPPortOpen(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func waitForTCPPort(addr string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if isTCPPortOpen(addr) {
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
 }

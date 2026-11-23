@@ -9,6 +9,10 @@ import (
 type Config struct {
 	Port                      string
 	GRPCAddr                  string
+	PaymentWorkerAddr         string
+	InventoryWorkerAddr       string
+	FulfillmentWorkerAddr     string
+	NotificationWorkerAddr    string
 	RedisAddr                 string
 	RedisPassword             string
 	RateLimitCapacity         float64
@@ -27,18 +31,31 @@ func Load() *Config {
 	return &Config{
 		Port:                      getEnv("PORT", "8080"),
 		GRPCAddr:                  getEnv("GRPC_ADDR", "localhost:50051"),
+		PaymentWorkerAddr:         getEnv("PAYMENT_WORKER_ADDR", "localhost:50051"),
+		InventoryWorkerAddr:       getEnv("INVENTORY_WORKER_ADDR", "localhost:50052"),
+		FulfillmentWorkerAddr:     getEnv("FULFILLMENT_WORKER_ADDR", "localhost:50053"),
+		NotificationWorkerAddr:    getEnv("NOTIFICATION_WORKER_ADDR", "localhost:50054"),
 		RedisAddr:                 getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:             getEnv("REDIS_PASSWORD", ""),
 		RateLimitCapacity:         getEnvFloat("RATE_LIMIT_CAPACITY", 5.0),
 		RateLimitRefill:           getEnvFloat("RATE_LIMIT_REFILL_RATE", 2.0),
-		OutboundRateLimitCapacity: getEnvFloat("OUTBOUND_RATE_LIMIT_CAPACITY", 10.0),
-		OutboundRateLimitRefill:   getEnvFloat("OUTBOUND_RATE_LIMIT_REFILL_RATE", 30.0),
+		OutboundRateLimitCapacity: getEnvFloat("OUTBOUND_RATE_LIMIT_CAPACITY", 3.0),
+		OutboundRateLimitRefill:   getEnvFloat("OUTBOUND_RATE_LIMIT_REFILL_RATE", 8.0),
 		DBHost:                    getEnv("DB_HOST", "localhost"),
 		DBPort:                    getEnv("DB_PORT", "5432"),
 		DBUser:                    getEnv("DB_USER", "postgres"),
 		DBPassword:                getEnv("DB_PASSWORD", "postgrespassword"),
 		DBName:                    getEnv("DB_NAME", "orchestrator_db"),
 		DBSSLMode:                 getEnv("DB_SSLMODE", "disable"),
+	}
+}
+
+func (c *Config) WorkerAddresses() map[string]string {
+	return map[string]string{
+		"Payment":      c.PaymentWorkerAddr,
+		"Inventory":    c.InventoryWorkerAddr,
+		"Fulfillment":  c.FulfillmentWorkerAddr,
+		"Notification": c.NotificationWorkerAddr,
 	}
 }
 
